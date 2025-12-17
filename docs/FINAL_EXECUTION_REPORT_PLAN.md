@@ -206,3 +206,12 @@ Final confirmation artifact for OP-CIENFUEGOS execution.
 
 VΩ.Σ.ARCHON
 
+---
+
+İstersen bunu doğrudan yazmak için tek komutluk sürümü de verebilirim:
+
+```bash
+cat <<'EOF' > docs/FINAL_EXECUTION_REPORT_PLAN.md
+# (content above)
+EOF
+```
