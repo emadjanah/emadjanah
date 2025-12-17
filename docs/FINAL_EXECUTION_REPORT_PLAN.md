@@ -1,194 +1,208 @@
-# Final Execution Report Implementation Plan
+# Final Execution Report — Implementation Plan
 
-This plan captures the minimal, production-ready setup to render the ARCHON “Final Execution Report” page with a live SSE feed for operation state, timeline, and logs.
+This document defines a minimal, production-ready implementation for the ARCHON
+**Final Execution Report**: a dark, audit-grade confirmation page that exposes a
+LOCKED + LIVE execution state via Server-Sent Events (SSE).
 
-## Final State (within 3 seconds)
-- **ARCHON STATUS:** `LIVE` + `LOCKED` badge with lock icon.
-- **Operation Card:** `OP-CIENFUEGOS / Cargo 25,000 MT ±10% / Incoterm / Laycan`.
-- **Execution Scope:** `Colombia (Primary)` + `Brazil (Backup)`.
-- **Locked Constraints (non-negotiable):** `Refinery COA only / No trader blending / Execution-Only / No upfront fees / Zero tolerance`.
-- **Timeline:** `NOW → T+7 Shortlist → T+10 Compliance Lock → T+30 Contract & Fixing`.
-- **Live Feed:** last 50 log lines with filters (`EWS/Bank/RFQ/Heartbeat`).
+---
 
-## Unified Data Model
-- **Operation State:** `{ status: LIVE|PAUSED|STOPPED, lock: LOCKED|UNLOCKED, health: NOMINAL|DEGRADED|CRITICAL }`.
-- **Timeline Step:** `{ id, title, eta, state: DONE|RUNNING|PENDING|FAILED }`.
-- **Log Entry:** `{ ts, level: INFO|WARN|ERROR, tag: EWS|BANK|RFQ|TIMELINE|HEARTBEAT, message }`.
+## Objective (3-Second Rule)
 
-## Backend (SSE)
-- Endpoint: `GET /api/stream` emits JSON every second `{ opState, timeline, lastLogs }`.
-- Use Node/Express or Next.js API Routes; SSE is sufficient for server → client pushes.
-- Logs source: in-memory ring buffer (e.g., 500 lines) or `logs/op-cienfuegos.log` read and tailed.
+Any viewer must confirm the execution state within **3 seconds**:
 
-```js
-import express from "express";
-import fs from "fs";
+- **ARCHON STATUS:** `LIVE` + `LOCKED` (non-negotiable)
+- **Operation Card:** `OP-CIENFUEGOS · Cargo 25,000 MT ±10% · Incoterm · Laycan`
+- **Execution Scope:** `Colombia (Primary)` + `Brazil (Backup)`
+- **Locked Constraints:**  
+  `Refinery COA only · No trader blending · Execution-Only · No upfront fees · Zero tolerance`
+- **Timeline:** `T+0 → T+7 → T+10 → T+30`
+- **Live Feed:** last 50 log lines with tags (EWS / BANK / RFQ / TIMELINE / HEARTBEAT)
+- **Snapshot Export:** one-click JSON for audit
 
-const app = express();
-const logBuffer = [];
+This page is **confirmation**, not monitoring.
 
-function pushLog(line) {
-  logBuffer.push(line);
-  if (logBuffer.length > 500) logBuffer.shift();
-}
+---
 
-function getLastLogs(n) {
-  return logBuffer.slice(-n);
-}
+## Architecture Decision
 
-// Seed example logs
-pushLog("[22:16:39]HEARTBEAT: SYSTEM NOMINAL");
-pushLog("[22:17:02]SENDING RFQ: OP-CIENFUEGOS/LAYCAN");
-pushLog("[22:17:20]BANK CLEARANCE: PRE-APPROVED");
+### Primary (This Repository)
+- **Backend:** Express
+- **Frontend:** Static HTML (`public/index.html`)
+- **Transport:** SSE (`GET /api/stream`)
+- **State Model:** In-memory + optional seeded log file
+- **Build Step:** None
 
-app.get("/api/stream", (req, res) => {
-  res.setHeader("Content-Type", "text/event-stream");
-  res.setHeader("Cache-Control", "no-cache");
-  res.setHeader("Connection", "keep-alive");
+### Alternative (Optional)
+- **Backend:** Next.js App Router SSE (`app/api/stream/route.ts`)
+- **Frontend:** React (Next)
+- Use only if SSR/React composition is required.
 
-  const interval = setInterval(() => {
-    const payload = {
-      opState: { status: "LIVE", lock: "LOCKED", health: "NOMINAL" },
-      timeline: [
-        { id: "now", title: "Auto-Execution Start", eta: "NOW", state: "RUNNING" },
-        { id: "t7", title: "Shortlist Confirmed", eta: "T+7", state: "PENDING" },
-        { id: "t10", title: "Compliance Lock", eta: "T+10", state: "PENDING" },
-        { id: "t30", title: "Contract & Fixing", eta: "T+30", state: "PENDING" },
-      ],
-      lastLogs: getLastLogs(50),
-    };
+> Do **not** mix both in the same deployment.
 
-    res.write(`data: ${JSON.stringify(payload)}\n\n`);
-  }, 1000);
+---
 
-  req.on("close", () => clearInterval(interval));
-});
+## Data Contract (SSE Payload)
 
-app.listen(3001, () => console.log("SSE stream on :3001"));
-```
+The `/api/stream` endpoint emits **once per second**:
 
-## Frontend (Next.js + Tailwind)
-- Use `EventSource` to subscribe once and push updates into state.
-- Parse incoming log lines on the client to derive `tag`:
-  - Contains `EWS` → `EWS`
-  - Contains `BANK CLEARANCE` → `BANK`
-  - Contains `SENDING RFQ` → `RFQ`
-  - Contains `SYNCING TIMELINE` → `TIMELINE`
-  - Contains `HEARTBEAT` → `HEARTBEAT`
-
-```tsx
-import { useEffect, useState } from "react";
-
-type OpState = { status: string; lock: string; health: string };
-type TimelineStep = { id: string; title: string; eta?: string; state: string };
-type LogEntry = { raw: string; tag: string };
-
-type StreamPayload = { opState: OpState; timeline: TimelineStep[]; lastLogs: string[] };
-
-function parseTag(line: string): string {
-  if (line.includes("EWS")) return "EWS";
-  if (line.includes("BANK CLEARANCE")) return "BANK";
-  if (line.includes("SENDING RFQ")) return "RFQ";
-  if (line.includes("SYNCING TIMELINE")) return "TIMELINE";
-  if (line.includes("HEARTBEAT")) return "HEARTBEAT";
-  return "GENERAL";
-}
-
-export default function ExecutionReport() {
-  const [data, setData] = useState<StreamPayload | null>(null);
-
-  useEffect(() => {
-    const es = new EventSource("/api/stream");
-    es.onmessage = (e) => setData(JSON.parse(e.data));
-    es.onerror = () => es.close();
-    return () => es.close();
-  }, []);
-
-  if (!data) return <div className="text-slate-300">Connecting…</div>;
-
-  const logs: LogEntry[] = data.lastLogs.map((raw) => ({ raw, tag: parseTag(raw) }));
-
-  return (
-    <div className="min-h-screen bg-slate-950 text-slate-100 p-6 space-y-4">
-      <header className="flex items-start justify-between">
-        <div>
-          <p className="text-sm text-amber-200">OP-CIENFUEGOS</p>
-          <h1 className="text-2xl font-semibold">Final Execution Report</h1>
-          <p className="text-xs text-slate-400">Cargo 25,000 MT ±10% • Incoterm • Laycan</p>
-        </div>
-        <div className="text-right space-y-1">
-          <div className="inline-flex items-center gap-2 rounded-full bg-emerald-500/10 px-3 py-1 text-sm text-emerald-200">
-            <span className="h-2 w-2 rounded-full bg-emerald-400 animate-pulse" />
-            ARCHON STATUS: LIVE
-            <span className="ml-2 inline-flex items-center gap-1 rounded-full bg-emerald-600/20 px-2 py-0.5 text-xs">LOCKED 🔒</span>
-          </div>
-          <p className="text-xs text-slate-400">Health: {data.opState.health}</p>
-        </div>
-      </header>
-
-      <section className="grid gap-4 lg:grid-cols-3">
-        <div className="rounded-xl border border-slate-800 bg-slate-900/60 p-4">
-          <h2 className="text-sm font-semibold text-slate-200">SYSTEM.LOG</h2>
-          <div className="mt-3 max-h-[520px] space-y-2 overflow-y-auto text-xs">
-            {logs.slice(-50).map((log, idx) => (
-              <div key={idx} className="flex items-start gap-2">
-                <span className="rounded-full bg-slate-800 px-2 py-0.5 text-[10px] text-slate-300">{log.tag}</span>
-                <span className="text-slate-100">{log.raw}</span>
-              </div>
-            ))}
-          </div>
-        </div>
-
-        <div className="rounded-xl border border-slate-800 bg-slate-900/60 p-4">
-          <h2 className="text-sm font-semibold text-slate-200">EXECUTION TIMELINE</h2>
-          <ol className="mt-4 space-y-3 text-sm">
-            {data.timeline.map((step) => (
-              <li key={step.id} className="flex items-center gap-3">
-                <span className="h-3 w-3 rounded-full bg-emerald-400" />
-                <div>
-                  <p className="font-medium text-slate-100">{step.title}</p>
-                  <p className="text-xs text-slate-400">{step.eta ?? ""} • {step.state}</p>
-                </div>
-              </li>
-            ))}
-          </ol>
-        </div>
-
-        <div className="space-y-4">
-          <div className="rounded-xl border border-slate-800 bg-slate-900/60 p-4">
-            <h2 className="text-sm font-semibold text-slate-200">EXECUTION SCOPE</h2>
-            <p className="mt-3 text-sm text-slate-100">Colombia (Primary)</p>
-            <p className="text-sm text-slate-300">Brazil (Backup)</p>
-          </div>
-          <div className="rounded-xl border border-slate-800 bg-slate-900/60 p-4">
-            <h2 className="text-sm font-semibold text-slate-200">LOCKED CONSTRAINTS</h2>
-            <ul className="mt-3 space-y-2 text-sm text-slate-100">
-              <li>Refinery COA only</li>
-              <li>No trader blending</li>
-              <li>Execution-Only</li>
-              <li>No upfront fees</li>
-              <li>Zero tolerance</li>
-            </ul>
-          </div>
-        </div>
-      </section>
-    </div>
-  );
+```json
+{
+  "opState": {
+    "status": "LIVE",
+    "lock": "LOCKED",
+    "health": "NOMINAL",
+    "killSwitch": "ARMED"
+  },
+  "timeline": [
+    { "id": "now", "title": "NOW · Auto-Execution Start", "eta": "T+0", "state": "RUNNING" },
+    { "id": "t7",  "title": "T+7 · Shortlist Confirmed", "eta": "T+7", "state": "PENDING" },
+    { "id": "t10", "title": "T+10 · Compliance Lock",    "eta": "T+10", "state": "PENDING" },
+    { "id": "t30", "title": "T+30 · Contract & Fixing",  "eta": "T+30", "state": "PENDING" }
+  ],
+  "lastLogs": [
+    "[22:16:39] HEARTBEAT: SYSTEM NOMINAL",
+    "[22:16:42] BANK CLEARANCE: PRIMED FOR DISBURSEMENT"
+  ],
+  "ews": { "status": "CLEAN", "timestamp": "2025-12-17T22:16:42Z" },
+  "bank": { "status": "PRIMED", "timestamp": "2025-12-17T22:16:42Z" }
 }
 ```
+
+---
+
+## Log Line Standard
+
+All log lines **must** follow this exact format:
+
+```
+[HH:MM:SS] <MESSAGE>
+```
+
+Examples:
+
+```
+[22:16:39] HEARTBEAT: SYSTEM NOMINAL
+[22:17:05] SENDING RFQ: REFINERY COA ONLY
+[22:17:10] EWS: SIGNAL CLEAN
+```
+
+This guarantees deterministic parsing and filtering.
+
+---
+
+## Timeline State Rules
+
+For each step with `target` (seconds since operation start):
+
+* `elapsed < target` → `PENDING`
+* `target ≤ elapsed < nextTarget` → `RUNNING`
+* `elapsed ≥ nextTarget` → `DONE`
+
+For the final step (`T+30`), use a small window (e.g., +8s) before marking `DONE`.
+
+Timeline **must** be computed from a **global operation start timestamp**, not per-client connection.
+
+---
+
+## Backend Requirements (Express)
+
+* SSE headers:
+
+  * `Content-Type: text/event-stream`
+  * `Cache-Control: no-cache`
+  * `Connection: keep-alive`
+  * `X-Accel-Buffering: no`
+* Send an initial comment to flush buffers:
+
+  ```
+  : connected
+  ```
+* Global `OP_STARTED_AT` timestamp
+* In-memory ring buffer (max 500 lines)
+* Optional seed file: `logs/op-cienfuegos.log`
+* Synthetic log generator allowed (demo mode)
+
+---
+
+## Frontend Requirements (Static HTML)
+
+* Dark, high-contrast, audit-grade UI
+* No framework dependency
+* SSE via `EventSource('/api/stream')`
+* Client-side features:
+
+  * Tag-based log filtering
+  * Timeline rendering
+  * Health / EWS / Bank indicators
+  * Snapshot export (JSON)
+* **No mutations** to server state
+
+---
 
 ## Snapshot Export
-- Add a button that downloads `JSON.stringify({ opState, timeline, lastLogs })` as `execution-snapshot.json` for audit.
 
-## Optional Indicators
-- **Kill-Switch:** badge showing `ARMED` + conditions (placeholder logic acceptable).
-- **EWS Panel:** latest scan status `CLEAN/WARNING/TRIGGERED` with timestamp.
-- **Bank Pre-Clearance:** latest status + timestamp.
-- **Audit Footer:** include `VΩ.Σ.ARCHON` + hash/session id for traceability.
+The UI must allow exporting the **current payload**:
 
-## Folder/Route Suggestions
-- `frontend/` for Next.js app (or use repo root if starting fresh).
-- `frontend/pages/api/stream.ts` for SSE route when using Next.js.
-- `frontend/app/execution-report/page.tsx` for the UI.
-- `logs/op-cienfuegos.log` optional if using file tailing.
-- `scripts/seed-logs.js` (optional) to push synthetic lines into the ring buffer.
+```json
+{
+  "capturedAt": "2025-12-17T22:18:10Z",
+  "...": "full SSE payload"
+}
+```
+
+Filename example:
+
+```
+archon-final-state-20251217-221810.json
+```
+
+Purpose: audit, traceability, evidence.
+
+---
+
+## File Structure (Primary)
+
+```
+.
+├─ server.js                  # Express + SSE
+├─ public/
+│  └─ index.html              # Final Execution Report UI
+├─ logs/
+│  └─ op-cienfuegos.log       # Optional seed logs
+├─ package.json
+└─ docs/
+   └─ FINAL_EXECUTION_REPORT_PLAN.md
+```
+
+---
+
+## Non-Goals
+
+* No authentication
+* No bidirectional control
+* No WebSockets
+* No real-time trading logic
+* No mutable operations
+
+This page **confirms** execution; it does not manage it.
+
+---
+
+## Audit Footer (Mandatory)
+
+Every render must display:
+
+```
+VΩ.Σ.ARCHON
+Execution-only · Refinery COA only · Zero tolerance
+```
+
+---
+
+## Status
+
+**APPROVED FOR USE**
+Final confirmation artifact for OP-CIENFUEGOS execution.
+
+VΩ.Σ.ARCHON
+
